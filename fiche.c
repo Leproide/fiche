@@ -31,6 +31,7 @@ $ cat fiche.c | nc localhost 9999
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 
 #include <pwd.h>
@@ -53,6 +54,9 @@ $ cat fiche.c | nc localhost 9999
  * Various declarations
  */
 const char *Fiche_Symbols = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+/* Initial chunk size for the dynamic receive buffer */
+#define FICHE_CHUNK (65536U)
 
 
 /******************************************************************************
@@ -141,7 +145,7 @@ static int create_directory(char *output_dir, char *slug);
  * @arg data Buffer with data received from the user
  * @arg path Path at which file containing data from the buffer will be created
  */
-static int save_to_file(const Fiche_Settings *s, uint8_t *data, char *slug);
+static int save_to_file(const Fiche_Settings *s, uint8_t *data, size_t data_len, char *slug);
 
 
 // Logging-related
@@ -560,8 +564,13 @@ static void *handle_connection(void *args) {
         print_status("Incoming connection from: %s (%s).", ip, hostname);
     }
 
-    // Create a buffer on the heap (avoids stack overflow with large buffer sizes)
-    uint8_t *buffer = calloc(c->settings->buffer_len, sizeof(uint8_t));
+    // Allocate an initial receive buffer; grow dynamically up to buffer_len.
+    // This avoids reserving the full -B allocation (e.g. 10 MB) for every
+    // connection regardless of actual upload size.
+    size_t buf_size = (FICHE_CHUNK < c->settings->buffer_len)
+                      ? FICHE_CHUNK : c->settings->buffer_len;
+
+    uint8_t *buffer = malloc(buf_size);
     if (!buffer) {
         print_error("Couldn't allocate buffer!");
         print_separator();
@@ -571,13 +580,38 @@ static void *handle_connection(void *args) {
         return NULL;
     }
 
-    // Read in a loop: MSG_WAITALL + SO_RCVTIMEO is unreliable when the client
-    // sends fewer bytes than buffer_len and then closes the connection.
+    // Read in a loop, growing the buffer as needed up to buffer_len.
     ssize_t r = 0, chunk;
-    while ((chunk = recv(c->socket, buffer + r,
-                         c->settings->buffer_len - (size_t)r, 0)) > 0) {
+    while (1) {
+        // Buffer full: try to grow before the next read
+        if ((size_t)r == buf_size) {
+            size_t new_size = buf_size * 2;
+            if (new_size > c->settings->buffer_len)
+                new_size = c->settings->buffer_len;
+
+            if (new_size == buf_size) {
+                // Hard limit reached — stop reading
+                print_error("Upload size limit reached (%u bytes).",
+                            c->settings->buffer_len);
+                break;
+            }
+
+            uint8_t *tmp = realloc(buffer, new_size);
+            if (!tmp) {
+                print_error("Couldn't grow receive buffer!");
+                free(buffer);
+                close(c->socket);
+                free(c);
+                pthread_exit(NULL);
+                return NULL;
+            }
+            buffer  = tmp;
+            buf_size = new_size;
+        }
+
+        chunk = recv(c->socket, buffer + r, buf_size - (size_t)r, 0);
+        if (chunk <= 0) break;
         r += chunk;
-        if ((size_t)r >= c->settings->buffer_len) break;
     }
 
     if (r <= 0) {
@@ -658,7 +692,7 @@ static void *handle_connection(void *args) {
 
 
     // Save to file failed, we have to finish here
-    if ( save_to_file(c->settings, buffer, slug) != 0 ) {
+    if ( save_to_file(c->settings, buffer, (size_t)r, slug) != 0 ) {
         print_error("Couldn't save a file!");
         print_separator();
 
@@ -698,6 +732,12 @@ static void *handle_connection(void *args) {
     free(buffer);
     free(slug);
     free(c);
+
+    // Return freed memory to the OS immediately.
+    // By default glibc holds freed heap memory in its arena; for a server
+    // that may allocate large buffers per connection this prevents the
+    // process RSS from growing unboundedly.
+    malloc_trim(0);
 
     pthread_exit(NULL);
 
@@ -762,7 +802,7 @@ static int create_directory(char *output_dir, char *slug) {
 }
 
 
-static int save_to_file(const Fiche_Settings *s, uint8_t *data, char *slug) {
+static int save_to_file(const Fiche_Settings *s, uint8_t *data, size_t data_len, char *slug) {
     char *file_name = "index.txt";
 
     // Additional 2 bytes are for 2 slashes
@@ -783,10 +823,9 @@ static int save_to_file(const Fiche_Settings *s, uint8_t *data, char *slug) {
         return -1;
     }
 
-    // Null-terminate buffer if not null terminated already
-    data[s->buffer_len - 1] = 0;
-
-    if ( fprintf(f, "%s", data) < 0 ) {
+    // Write exactly data_len bytes; fwrite handles binary data and null bytes
+    // correctly, unlike fprintf("%s") which would stop at the first null byte.
+    if ( fwrite(data, 1, data_len, f) != data_len ) {
         fclose(f);
         free(path);
         return -1;
