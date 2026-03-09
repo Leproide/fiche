@@ -560,11 +560,26 @@ static void *handle_connection(void *args) {
         print_status("Incoming connection from: %s (%s).", ip, hostname);
     }
 
-    // Create a buffer
-    uint8_t buffer[c->settings->buffer_len];
-    memset(buffer, 0, c->settings->buffer_len);
+    // Create a buffer on the heap (avoids stack overflow with large buffer sizes)
+    uint8_t *buffer = calloc(c->settings->buffer_len, sizeof(uint8_t));
+    if (!buffer) {
+        print_error("Couldn't allocate buffer!");
+        print_separator();
+        close(c->socket);
+        free(c);
+        pthread_exit(NULL);
+        return NULL;
+    }
 
-    const int r = recv(c->socket, buffer, sizeof(buffer), MSG_WAITALL);
+    // Read in a loop: MSG_WAITALL + SO_RCVTIMEO is unreliable when the client
+    // sends fewer bytes than buffer_len and then closes the connection.
+    ssize_t r = 0, chunk;
+    while ((chunk = recv(c->socket, buffer + r,
+                         c->settings->buffer_len - (size_t)r, 0)) > 0) {
+        r += chunk;
+        if ((size_t)r >= c->settings->buffer_len) break;
+    }
+
     if (r <= 0) {
         print_error("No data received from the client!");
         print_separator();
@@ -573,10 +588,11 @@ static void *handle_connection(void *args) {
         close(c->socket);
 
         // Cleanup
+        free(buffer);
         free(c);
         pthread_exit(NULL);
 
-        return 0;
+        return NULL;
     }
 
     // - Check if request was performed with a known protocol
@@ -614,9 +630,10 @@ static void *handle_connection(void *args) {
             print_separator();
 
             // Cleanup
-            free(c);
+            free(buffer);
             free(slug);
             close(c->socket);
+            free(c);
             pthread_exit(NULL);
             return NULL;
         }
@@ -633,6 +650,7 @@ static void *handle_connection(void *args) {
         close(c->socket);
 
         // Cleanup
+        free(buffer);
         free(c);
         pthread_exit(NULL);
         return NULL;
@@ -647,6 +665,7 @@ static void *handle_connection(void *args) {
         close(c->socket);
 
         // Cleanup
+        free(buffer);
         free(c);
         free(slug);
         pthread_exit(NULL);
@@ -665,7 +684,7 @@ static void *handle_connection(void *args) {
         write(c->socket, url, len);
     }
 
-    print_status("Received %d bytes, saved to: %s.", r, slug);
+    print_status("Received %zd bytes, saved to: %s.", r, slug);
     print_separator();
 
     // Log connection
@@ -676,6 +695,7 @@ static void *handle_connection(void *args) {
     close(c->socket);
 
     // Perform cleanup of values used in this thread
+    free(buffer);
     free(slug);
     free(c);
 
