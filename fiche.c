@@ -58,6 +58,10 @@ const char *Fiche_Symbols = "abcdefghijklmnopqrstuvwxyz0123456789";
 /* Initial chunk size for the dynamic receive buffer */
 #define FICHE_CHUNK (65536U)
 
+/* Delete token */
+#define TOKEN_LEN 32
+#define TOKEN_SYMBOLS "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
 
 /******************************************************************************
  * Inner structs
@@ -183,6 +187,26 @@ static void get_date(char *buf);
 
 
 /**
+ * @brief Generates a random delete token
+ */
+static void generate_token(char *out);
+
+/**
+ * @brief Saves delete token to .token file in slug directory
+ */
+static int save_token(const Fiche_Settings *s, const char *token, const char *slug);
+
+/**
+ * @brief Handles a delete connection
+ */
+static void *handle_delete(void *args);
+
+/**
+ * @brief Runs the delete service on a separate thread
+ */
+static void *run_delete_server(void *arg);
+
+/**
  * @brief Time seed
  */
 unsigned int seed;
@@ -218,7 +242,9 @@ void fiche_init(Fiche_Settings *settings) {
         // path to banlist
         NULL,
         // path to whitelist
-        NULL
+        NULL,
+        // delete port
+        0
     };
 
     // Copy default settings to provided instance
@@ -275,6 +301,26 @@ int fiche_run(Fiche_Settings settings) {
     if ( set_domain_name(&settings) != 0 ) {
         print_error("Was not able to set domain name!");
         return -1;
+    }
+
+    // Start delete service on a separate thread if port is configured
+    if (settings.delete_port > 0) {
+        Fiche_Settings *sp = malloc(sizeof(*sp));
+        if (!sp) {
+            print_error("Couldn't allocate delete service settings!");
+            return -1;
+        }
+        *sp = settings;
+        pthread_t del_tid;
+        if (pthread_create(&del_tid, NULL, run_delete_server, sp) != 0) {
+            print_error("Couldn't start delete server!");
+            free(sp);
+        } else {
+            pthread_detach(del_tid);
+            print_status("Delete service listening on: %s:%d.",
+                         settings.listen_addr, settings.delete_port);
+            print_separator();
+        }
     }
 
     // Main loop in this method
@@ -706,16 +752,59 @@ static void *handle_connection(void *args) {
         return NULL;
     }
 
+    // Generate and save delete token (best-effort; non-fatal if it fails)
+    char token[TOKEN_LEN + 1];
+    int has_token = 0;
+    if (c->settings->delete_port > 0) {
+        generate_token(token);
+        has_token = (save_token(c->settings, token, slug) == 0);
+        if (!has_token) {
+            print_error("Couldn't save delete token for: %s.", slug);
+        }
+    }
+
     // Write a response to the user
     {
-        // Create an url (additional byte for slash and one for new line)
-        const size_t len = strlen(c->settings->domain) + strlen(slug) + 3;
+        const char *domain = c->settings->domain;
 
-        char url[len];
-        snprintf(url, len, "%s%s%s%s", c->settings->domain, "/", slug, "\n");
+        if (has_token) {
+            // URL + delete instructions
+            // Format:
+            //   https://domain.com/slug\n
+            //   \n
+            //   To delete this paste:\n
+            //   echo -e "slug\\ntoken" | nc domain.com PORT\n
+            char host[256];
+            // Extract bare hostname from domain (strip scheme if present)
+            const char *h = strstr(domain, "://");
+            h = h ? h + 3 : domain;
+            snprintf(host, sizeof(host), "%s", h);
+            // Strip trailing slash if any
+            size_t hlen = strlen(host);
+            if (hlen > 0 && host[hlen - 1] == '/') host[hlen - 1] = '\0';
 
-        // Send the response
-        write(c->socket, url, len);
+            size_t len = strlen(domain) + strlen(slug)
+                         + strlen(host) + strlen(slug) + strlen(token)
+                         + 64;
+            char *resp = malloc(len);
+            if (resp) {
+                snprintf(resp, len,
+                    "%s/%s\n"
+                    "\n"
+                    "To delete this paste:\n"
+                    "echo -e \"%s\\\\n%s\" | nc %s %d\n",
+                    domain, slug,
+                    slug, token, host, c->settings->delete_port);
+                write(c->socket, resp, strlen(resp));
+                free(resp);
+            }
+        } else {
+            // Plain URL only
+            const size_t len = strlen(domain) + strlen(slug) + 3;
+            char url[len];
+            snprintf(url, len, "%s/%s\n", domain, slug);
+            write(c->socket, url, len);
+        }
     }
 
     print_status("Received %zd bytes, saved to: %s.", r, slug);
@@ -741,6 +830,220 @@ static void *handle_connection(void *args) {
 
     pthread_exit(NULL);
 
+    return NULL;
+}
+
+
+/******************************************************************************
+ * Token helpers
+ */
+
+static void generate_token(char *out) {
+    static const char syms[] = TOKEN_SYMBOLS;
+    const size_t nsyms = sizeof(syms) - 1;
+    for (int i = 0; i < TOKEN_LEN; i++) {
+        out[i] = syms[rand_r(&seed) % nsyms];
+    }
+    out[TOKEN_LEN] = '\0';
+}
+
+static int save_token(const Fiche_Settings *s, const char *token, const char *slug) {
+    // Path: <output_dir>/<slug>/.token
+    size_t len = strlen(s->output_dir_path) + strlen(slug) + 9; // /.token + null
+    char *path = malloc(len);
+    if (!path) return -1;
+    snprintf(path, len, "%s/%s/.token", s->output_dir_path, slug);
+
+    FILE *f = fopen(path, "w");
+    free(path);
+    if (!f) return -1;
+    fprintf(f, "%s", token);
+    fclose(f);
+    return 0;
+}
+
+
+/******************************************************************************
+ * Delete service
+ * Listens on delete_port.
+ * Client sends: <slug>\n<token>\n
+ * Server verifies token, deletes paste directory if match.
+ */
+
+static void *handle_delete(void *args) {
+    struct fiche_connection *c = (struct fiche_connection *)args;
+
+    // Read slug\ntoken\n in one shot — client sends both lines at once
+    char buf[128];
+    memset(buf, 0, sizeof(buf));
+    ssize_t n = recv(c->socket, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) {
+        close(c->socket); free(c); pthread_exit(NULL); return NULL;
+    }
+
+    // Split on first \n to get slug and token
+    char slug[65];
+    char token_in[TOKEN_LEN + 4];
+    memset(slug, 0, sizeof(slug));
+    memset(token_in, 0, sizeof(token_in));
+
+    char *nl = memchr(buf, '\n', (size_t)n);
+    if (!nl) {
+        write(c->socket, "invalid request\n", 16);
+        close(c->socket); free(c); pthread_exit(NULL); return NULL;
+    }
+
+    size_t slug_len = (size_t)(nl - buf);
+    if (slug_len == 0 || slug_len >= sizeof(slug)) {
+        write(c->socket, "invalid slug\n", 13);
+        close(c->socket); free(c); pthread_exit(NULL); return NULL;
+    }
+    memcpy(slug, buf, slug_len);
+    // Strip \r if present
+    if (slug[slug_len - 1] == '\r') slug[slug_len - 1] = '\0';
+
+    char *token_start = nl + 1;
+    size_t token_raw_len = (size_t)(buf + n - token_start);
+    if (token_raw_len == 0 || token_raw_len >= sizeof(token_in)) {
+        write(c->socket, "invalid token\n", 14);
+        close(c->socket); free(c); pthread_exit(NULL); return NULL;
+    }
+    memcpy(token_in, token_start, token_raw_len);
+    // Strip trailing \n and \r
+    for (int i = 0; token_in[i]; i++) {
+        if (token_in[i] == '\n' || token_in[i] == '\r') { token_in[i] = '\0'; break; }
+    }
+
+    // Validate slug: only alphanumeric, no path traversal
+    for (int i = 0; slug[i]; i++) {
+        char ch = slug[i];
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))) {
+            write(c->socket, "invalid slug\n", 13);
+            close(c->socket); free(c); pthread_exit(NULL); return NULL;
+        }
+    }
+
+    // Build path to .token file
+    size_t plen = strlen(c->settings->output_dir_path) + strlen(slug) + 9;
+    char *token_path = malloc(plen);
+    if (!token_path) {
+        close(c->socket); free(c); pthread_exit(NULL); return NULL;
+    }
+    snprintf(token_path, plen, "%s/%s/.token", c->settings->output_dir_path, slug);
+
+    // Read stored token
+    FILE *f = fopen(token_path, "r");
+    free(token_path);
+    if (!f) {
+        write(c->socket, "not found\n", 10);
+        close(c->socket); free(c); pthread_exit(NULL); return NULL;
+    }
+    char token_stored[TOKEN_LEN + 4];
+    memset(token_stored, 0, sizeof(token_stored));
+    fgets(token_stored, sizeof(token_stored), f);
+    fclose(f);
+    // Strip trailing \n and \r left by fgets
+    for (int i = 0; token_stored[i]; i++) {
+        if (token_stored[i] == '\n' || token_stored[i] == '\r') {
+            token_stored[i] = '\0'; break;
+        }
+    }
+
+    // Constant-time comparison to avoid timing attacks
+    int match = 1;
+    if (strlen(token_in) != strlen(token_stored)) {
+        match = 0;
+    } else {
+        for (size_t i = 0; i < strlen(token_stored); i++) {
+            if (token_in[i] != token_stored[i]) match = 0;
+        }
+    }
+
+    if (!match) {
+        write(c->socket, "unauthorized\n", 13);
+        close(c->socket); free(c); pthread_exit(NULL); return NULL;
+    }
+
+    // Delete paste directory: remove index.txt, .token, then the directory
+    size_t dlen = strlen(c->settings->output_dir_path) + strlen(slug) + 2;
+    char *dir_path = malloc(dlen + 12); // extra for /index.txt
+    if (!dir_path) {
+        close(c->socket); free(c); pthread_exit(NULL); return NULL;
+    }
+
+    snprintf(dir_path, dlen + 12, "%s/%s/index.txt", c->settings->output_dir_path, slug);
+    unlink(dir_path);
+
+    snprintf(dir_path, dlen + 12, "%s/%s/.token", c->settings->output_dir_path, slug);
+    unlink(dir_path);
+
+    snprintf(dir_path, dlen, "%s/%s", c->settings->output_dir_path, slug);
+    if (rmdir(dir_path) == 0) {
+        write(c->socket, "deleted\n", 8);
+        print_status("Paste deleted: %s.", slug);
+    } else {
+        write(c->socket, "error\n", 6);
+    }
+    free(dir_path);
+
+    close(c->socket);
+    free(c);
+    pthread_exit(NULL);
+    return NULL;
+}
+
+
+static void *run_delete_server(void *arg) {
+    Fiche_Settings *settings = (Fiche_Settings *)arg;
+
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) {
+        print_error("Delete: couldn't create socket!");
+        free(settings); pthread_exit(NULL); return NULL;
+    }
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+
+    struct sockaddr_in addr;
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = inet_addr(settings->listen_addr);
+    addr.sin_port        = htons(settings->delete_port);
+
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        print_error("Delete: couldn't bind to port %d!", settings->delete_port);
+        close(s); free(settings); pthread_exit(NULL); return NULL;
+    }
+    if (listen(s, 128) != 0) {
+        print_error("Delete: couldn't listen!");
+        close(s); free(settings); pthread_exit(NULL); return NULL;
+    }
+
+    while (1) {
+        struct sockaddr_in caddr;
+        socklen_t clen = sizeof(caddr);
+        int cs = accept(s, (struct sockaddr *)&caddr, &clen);
+        if (cs < 0) continue;
+
+        const struct timeval timeout = {5, 0};
+        setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(cs, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+        struct fiche_connection *conn = malloc(sizeof(*conn));
+        if (!conn) { close(cs); continue; }
+        conn->socket   = cs;
+        conn->address  = caddr;
+        conn->settings = settings;
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_delete, conn) != 0) {
+            close(cs); free(conn);
+        } else {
+            pthread_detach(tid);
+        }
+    }
+
+    close(s);
+    free(settings);
+    pthread_exit(NULL);
     return NULL;
 }
 
