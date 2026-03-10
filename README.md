@@ -144,11 +144,13 @@ free(c);
 | 2 | `handle_connection` | `MSG_WAITALL` + `SO_RCVTIMEO` | Data discarded, no URL returned, no file saved |
 | 3 | `handle_connection` | Use-after-free | Undefined behaviour on slug generation failure |
 
-#Delete a paste
+# Delete a paste
 Use case: remove a paste you uploaded — requires the delete token returned at upload time
 
 # Linux / macOS
 echo -e "slug\ntoken" | nc termbin.huginn.ovh 9998
+
+Change the delete port with -P parameter
 
 =====
 
