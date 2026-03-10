@@ -90,7 +90,10 @@ typedef struct Fiche_Settings {
      */
     char *whitelist_path;
 
-
+    /**
+     * @brief Port for the delete service (0 = disabled)
+     */
+    uint16_t delete_port;
 
 } Fiche_Settings;
 

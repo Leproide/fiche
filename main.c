@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
 
     // Parse input arguments
     int c;
-    while ((c = getopt(argc, argv, "D6eSL:p:b:s:d:o:l:B:u:w:")) != -1) {
+    while ((c = getopt(argc, argv, "D6eSL:p:b:s:d:o:l:B:u:w:P:")) != -1) {
         switch (c) {
 
             // domain
@@ -79,6 +79,13 @@ int main(int argc, char **argv) {
             case 'S':
             {
                 fs.https = true;
+            }
+            break;
+
+            // delete service port
+            case 'P':
+            {
+                fs.delete_port = (uint16_t)atoi(optarg);
             }
             break;
 
