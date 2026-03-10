@@ -1,3 +1,158 @@
+# Fiche — Bug Fixes
+
+This document describes the bugs found and fixed in the original
+[fiche](https://github.com/solusipse/fiche/) source code (`fiche.c`).
+
+---
+
+## Bug 1 — Stack overflow with large buffer sizes
+
+### Location
+`handle_connection()` — `fiche.c`
+
+### Root cause
+The receive buffer was declared as a **Variable Length Array (VLA) on the thread stack**:
+
+```c
+// Original — stack allocation
+uint8_t buffer[c->settings->buffer_len];
+```
+
+The default value of `buffer_len` is already 32 768 bytes (32 KB).
+When a larger value is passed via `-B` (e.g. 10 MB), the thread stack overflows
+immediately on entry, before any data is received. The crash is silent: the OS
+kills the thread with no error message, no URL is returned, and no file is
+created.
+
+VLAs on the stack are also flagged as undefined behaviour by `-Wpedantic` when
+the size is not a compile-time constant.
+
+### Fix
+Replaced the VLA with a **heap allocation** via `calloc`, with proper cleanup on
+every exit path:
+
+```c
+// Fixed — heap allocation
+uint8_t *buffer = calloc(c->settings->buffer_len, sizeof(uint8_t));
+if (!buffer) {
+    print_error("Couldn't allocate buffer!");
+    close(c->socket);
+    free(c);
+    pthread_exit(NULL);
+    return NULL;
+}
+// ... use buffer ...
+free(buffer);   // released on every exit path
+```
+
+---
+
+## Bug 2 — Connections silently dropped with partial data
+
+### Location
+`handle_connection()` — `fiche.c`
+
+### Root cause
+The original code combined `MSG_WAITALL` with `SO_RCVTIMEO`:
+
+```c
+// Original
+const struct timeval timeout = { 5, 0 };
+setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, ...);
+// ...
+const int r = recv(c->socket, buffer, sizeof(buffer), MSG_WAITALL);
+if (r <= 0) { /* discard everything */ }
+```
+
+`MSG_WAITALL` instructs the kernel to block until **exactly** `buffer_len` bytes
+are received. The typical fiche client (`cat file | nc host 9999`) sends N bytes
+where N < `buffer_len` and then **closes the connection**.
+
+On Linux, when `SO_RCVTIMEO` is set and the client closes before filling the
+buffer, `recv` may return either:
+
+- `-1` with `errno = EAGAIN` (timeout fired with partial data pending), or
+- `0` (client closed the connection cleanly before the timeout).
+
+Both cases satisfy `r <= 0`, causing the thread to **discard all received data,
+close the socket without responding, and exit** — as if nothing had been
+received. The paste is never saved and the client gets no URL back.
+
+### Fix
+Removed `MSG_WAITALL` and replaced the single `recv` call with a **read loop**
+that accumulates data until the client closes the connection or the buffer is
+full:
+
+```c
+// Fixed — read loop, no MSG_WAITALL
+ssize_t r = 0, chunk;
+while ((chunk = recv(c->socket, buffer + r,
+                     c->settings->buffer_len - (size_t)r, 0)) > 0) {
+    r += chunk;
+    if ((size_t)r >= c->settings->buffer_len) break;
+}
+if (r <= 0) { /* truly no data received */ }
+```
+
+The loop exits naturally when the client closes the TCP connection (EOF →
+`recv` returns 0), regardless of whether the buffer was filled. The 5-second
+`SO_RCVTIMEO` is still in place and still works correctly as a stall guard.
+
+The return type was also changed from `int` to `ssize_t` to match the return
+type of `recv`, and the corresponding `printf` format specifier was updated from
+`%d` to `%zd` for correctness under `-Wpedantic`.
+
+---
+
+## Bug 3 — Use-after-free on slug generation failure
+
+### Location
+`handle_connection()` — `fiche.c`, inside the slug generation loop
+
+### Root cause
+In the error path triggered when the slug generation loop exceeds 128 attempts,
+the original code called `free(c)` before `close(c->socket)`:
+
+```c
+// Original — use-after-free
+free(c);
+free(slug);
+close(c->socket);   // c->socket read after c was freed
+```
+
+`c->socket` is a field of the struct pointed to by `c`. Reading it after
+`free(c)` is undefined behaviour, detected by GCC with `-Wuse-after-free`.
+
+### Fix
+Reordered the cleanup so the socket is closed before the struct is freed:
+
+```c
+// Fixed
+free(buffer);
+free(slug);
+close(c->socket);   // socket closed while c is still valid
+free(c);
+```
+
+---
+
+## Summary
+
+| # | Location | Type | Effect |
+|---|----------|------|--------|
+| 1 | `handle_connection` | Stack overflow (VLA) | Crash / silent thread death with large `-B` values |
+| 2 | `handle_connection` | `MSG_WAITALL` + `SO_RCVTIMEO` | Data discarded, no URL returned, no file saved |
+| 3 | `handle_connection` | Use-after-free | Undefined behaviour on slug generation failure |
+
+#Delete a paste
+Use case: remove a paste you uploaded — requires the delete token returned at upload time
+
+# Linux / macOS
+echo -e "slug\ntoken" | nc termbin.huginn.ovh 9998
+
+=====
+
+
 fiche [![Build Status](https://travis-ci.org/solusipse/fiche.svg?branch=master)](https://travis-ci.org/solusipse/fiche)
 =====
 
