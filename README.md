@@ -147,7 +147,7 @@ free(c);
 # Delete a paste
 Use case: remove a paste you uploaded — requires the delete token returned at upload time
 
-# Linux / macOS
+## Linux / macOS
 echo -e "slug\ntoken" | nc termbin.huginn.ovh 9998
 
 Change the delete port with -P parameter
