@@ -455,11 +455,25 @@ __WARNING:__ not implemented yet
 
 There's a simple systemd example:
 ```
+# /etc/systemd/system/termbin.service
+# TermBin systemd service unit (fiche TCP pastebin)
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Author: https://github.com/Leproide
+
 [Unit]
-Description=FICHE-SERVER
+Description=TermBin (fiche TCP pastebin)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/fiche -d yourdomain.com -o /path/to/output -l /path/to/log -u youruser
+Type=simple
+ExecStart=/opt/termbin/fiche -d termbin.muninn.ovh -o /var/www/termbin/paste -S -s 16 -B 10485760 -l /opt/termbin/logs/fiche.log -P 9998
+Restart=always
+RestartSec=2
+
+# Hardening (optional):
+# User=termbin
+# Group=termbin
 
 [Install]
 WantedBy=multi-user.target
