@@ -456,10 +456,9 @@ __WARNING:__ not implemented yet
 There's a simple systemd example:
 ```
 # /etc/systemd/system/termbin.service
-# TermBin systemd service unit (fiche TCP pastebin)
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Author: https://github.com/Leproide
-
+# TermBin (fiche TCP pastebin) — unit consolidato con sandbox
 [Unit]
 Description=TermBin (fiche TCP pastebin)
 After=network-online.target
@@ -467,13 +466,27 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=termbin
+Group=termbin
+# fiche in foreground: systemd traccia il processo reale
 ExecStart=/opt/termbin/fiche -d termbin.muninn.ovh -o /var/www/termbin/paste -S -s 16 -B 10485760 -l /opt/termbin/logs/fiche.log -P 9998
 Restart=always
 RestartSec=2
 
-# Hardening (optional):
-# User=termbin
-# Group=termbin
+# --- sandbox ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/www/termbin/paste /opt/termbin/logs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=true
 
 [Install]
 WantedBy=multi-user.target
