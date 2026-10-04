@@ -3,6 +3,10 @@
 This document describes the bugs found and fixed in the original
 [fiche](https://github.com/solusipse/fiche/) source code (`fiche.c`).
 
+# Fiche Ratelimit + Ban
+
+[Fiche/Termbin Ratelimit](https://github.com/Leproide/Fiche-Termbin-Ratelimit/tree/master)
+
 ---
 
 ## Bug 1 — Stack overflow with large buffer sizes
